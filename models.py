@@ -76,5 +76,5 @@ class AnalysisResult(BaseModel):
         description="List of bearish arguments and cons mentioned about the stock(s)"
     )
     commenter_sentiments: list[CommenterSentiment] = Field(
-        description="Sentiment classification for each commenter in the thread"
+        description="Sentiment classification for EVERY SINGLE commenter in the thread. Do not skip any - include all commenters from the provided comments section."
     )

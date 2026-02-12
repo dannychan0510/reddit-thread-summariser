@@ -1,5 +1,7 @@
 import logging
+import random
 import time
+from typing import List
 
 from google import genai
 from google.genai import types
@@ -7,24 +9,56 @@ from google.genai import types
 logging.getLogger("google_genai.types").setLevel(logging.ERROR)
 
 import config
-from models import AnalysisResult, RedditThread
+from models import AnalysisResult, RedditComment, RedditThread
 
 MAX_RETRIES = 2
 RETRY_DELAY_SECONDS = 2
+MAX_COMMENTS_FOR_ANALYSIS = 50
+
+
+def _sample_comments(comments: List[RedditComment], seed: int = None) -> List[RedditComment]:
+    """Sample comments for analysis.
+
+    If <= 50 comments: return all
+    If > 50 comments: randomly select 50 using deterministic seeding
+
+    Args:
+        comments: List of comments to sample from
+        seed: Random seed for reproducibility (uses hash of comment IDs if not provided)
+
+    Returns:
+        Sampled list of comments
+    """
+    if len(comments) <= MAX_COMMENTS_FOR_ANALYSIS:
+        return comments
+
+    # Use deterministic seed based on comment IDs for reproducibility
+    if seed is None:
+        seed = hash(''.join(c.comment_id for c in comments[:10])) % (2**32)
+
+    rng = random.Random(seed)
+    return rng.sample(comments, MAX_COMMENTS_FOR_ANALYSIS)
 
 
 def build_prompt(thread: RedditThread) -> str:
     """Build the analysis prompt from thread data, truncating if needed."""
     comments, was_truncated, original_count = _truncate_comments(thread)
 
-    truncation_note = ""
+    # Sample comments if we have more than MAX_COMMENTS_FOR_ANALYSIS
+    sampled_comments = _sample_comments(comments)
+    was_sampled = len(sampled_comments) < len(comments)
+
+    # Build note about truncation and/or sampling
+    notes = []
     if was_truncated:
-        truncation_note = (
-            f" - truncated from {original_count} to {len(comments)} most upvoted"
-        )
+        notes.append(f"truncated from {original_count} to {len(comments)} highest-scored")
+    if was_sampled:
+        notes.append(f"randomly sampled {len(sampled_comments)} from {len(comments)} for analysis")
+
+    truncation_note = " - " + ", ".join(notes) if notes else ""
 
     formatted_comments = []
-    for c in comments:
+    for c in sampled_comments:
         depth_label = " (reply)" if c.depth > 0 else ""
         header = f"[u/{c.author} | score: {c.score}{depth_label}]"
         formatted_comments.append(f"{header}\n{c.body}")
@@ -42,10 +76,12 @@ Score: {thread.score}
 
 {thread.selftext}
 
-=== COMMENTS ({len(comments)} total{truncation_note}) ===
+=== COMMENTS ({len(sampled_comments)} total{truncation_note}) ===
 {comments_text}
 
-Based on the above discussion, provide your analysis. Identify any stock tickers mentioned. Summarise the key discussion points. List the pros (bullish arguments) and cons (bearish arguments) for the stock(s). For each commenter, classify their overall sentiment toward the stock(s) being discussed as positive, negative, or neutral, with a brief reason. If there are no comments, return an empty list for commenter_sentiments."""
+Based on the above discussion, provide your analysis. Identify any stock tickers mentioned. Summarise the key discussion points. List the pros (bullish arguments) and cons (bearish arguments) for the stock(s).
+
+IMPORTANT: For EVERY SINGLE commenter shown above, you MUST classify their overall sentiment toward the stock(s) being discussed as positive, negative, or neutral, with a brief reason. Do not skip any commenter - analyze all {len(sampled_comments)} comments above. If a user has multiple comments, combine their sentiment into one entry. If there are no comments, return an empty list for commenter_sentiments."""
 
 
 def analyse_thread(thread: RedditThread) -> AnalysisResult:

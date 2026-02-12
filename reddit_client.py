@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from typing import Optional, Tuple
+import time
+from typing import List, Optional, Set, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -12,6 +13,11 @@ from models import RedditComment, RedditThread
 REDDIT_URL_PATTERN = re.compile(
     r"https?://(?:www\.)?(?:old\.)?reddit\.com/r/(\w+)/comments/(\w+)"
 )
+
+# Limit how many "load more" batches to fetch to avoid excessive requests
+MAX_LOAD_MORE_BATCHES = 5
+# Delay between additional requests to be respectful to Reddit
+LOAD_MORE_DELAY_SECONDS = 1
 
 
 def _parse_url(url: str) -> Tuple[str, str]:
@@ -46,8 +52,12 @@ def _is_valid_comment(div: BeautifulSoup) -> bool:
     return body not in ("[removed]", "[deleted]")
 
 
-def fetch_thread(url: str) -> RedditThread:
+def fetch_thread(url: str, load_more_comments: bool = True) -> RedditThread:
     """Fetch a Reddit thread by scraping old.reddit.com.
+
+    Args:
+        url: The Reddit post URL.
+        load_more_comments: If True, fetch additional comment batches beyond the initial page.
 
     Raises:
         ValueError: If the URL is invalid.
@@ -56,10 +66,11 @@ def fetch_thread(url: str) -> RedditThread:
     """
     old_url, subreddit = _parse_url(url)
 
+    # Increased from 500 to 1500 to get more comments in initial request
     try:
         response = requests.get(
             old_url,
-            params={"limit": 500},
+            params={"limit": 1500},
             headers={"User-Agent": config.USER_AGENT},
             timeout=30,
         )
@@ -80,6 +91,15 @@ def fetch_thread(url: str) -> RedditThread:
     author = _extract_post_author(soup)
     score = _extract_post_score(soup)
     comments = _extract_comments(soup)
+
+    # Fetch additional comment batches if requested
+    if load_more_comments:
+        # Track existing comment IDs to avoid duplicates
+        seen_ids = {c.comment_id for c in comments if c.comment_id}
+        additional_comments = _fetch_more_comments(soup, old_url, seen_ids)
+        comments.extend(additional_comments)
+
+    # Sort by score descending to prioritize high-value comments
     comments.sort(key=lambda c: c.score, reverse=True)
 
     return RedditThread(
@@ -152,7 +172,77 @@ def _extract_post_score(soup: BeautifulSoup) -> int:
     return 0
 
 
-def _extract_comments(soup: BeautifulSoup) -> list[RedditComment]:
+def _fetch_more_comments(
+    soup: BeautifulSoup, base_url: str, seen_ids: Set[str]
+) -> List[RedditComment]:
+    """Fetch additional comment batches from 'load more comments' links.
+
+    Args:
+        soup: The BeautifulSoup object of the initial page.
+        base_url: The base URL of the thread.
+        seen_ids: Set of comment IDs already fetched to avoid duplicates.
+
+    Returns:
+        List of additional comments fetched from 'load more' batches.
+    """
+    additional_comments = []
+    batches_fetched = 0
+
+    # Find all "load more comments" links
+    # These are typically in <div class="morechildren"> or have "morecomments" class
+    more_links = []
+
+    # Look for "continue this thread" links
+    for link in soup.find_all("a", class_="button"):
+        if "continue this thread" in link.get_text().lower():
+            href = link.get("href", "")
+            if href and href.startswith("/"):
+                more_links.append("https://old.reddit.com" + href)
+            elif href and href.startswith("http"):
+                # Convert to old.reddit.com
+                href = re.sub(
+                    r"https?://(?:www\.)?reddit\.com", "https://old.reddit.com", href
+                )
+                more_links.append(href)
+
+    # Limit the number of additional requests
+    more_links = more_links[:MAX_LOAD_MORE_BATCHES]
+
+    for link_url in more_links:
+        if batches_fetched >= MAX_LOAD_MORE_BATCHES:
+            break
+
+        try:
+            time.sleep(LOAD_MORE_DELAY_SECONDS)
+            response = requests.get(
+                link_url,
+                params={"limit": 1500},
+                headers={"User-Agent": config.USER_AGENT},
+                timeout=30,
+            )
+
+            if not response.ok:
+                continue
+
+            batch_soup = BeautifulSoup(response.text, "html.parser")
+            batch_comments = _extract_comments(batch_soup)
+
+            # Deduplicate comments by ID
+            for comment in batch_comments:
+                if comment.comment_id and comment.comment_id not in seen_ids:
+                    seen_ids.add(comment.comment_id)
+                    additional_comments.append(comment)
+
+            batches_fetched += 1
+
+        except Exception:
+            # If fetching a batch fails, continue with what we have
+            continue
+
+    return additional_comments
+
+
+def _extract_comments(soup: BeautifulSoup) -> List[RedditComment]:
     """Extract all comments from the page."""
     comment_area = soup.find("div", class_="commentarea")
     if not comment_area:
